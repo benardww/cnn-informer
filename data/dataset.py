@@ -127,29 +127,93 @@ class CHBMITPatientDataset(Dataset):
 def make_patient_dataloaders(
     patient: str,
     data_root: Path,
-    train_ratio: float = config.TRAIN_RATIO,
     batch_size: int = config.BATCH_SIZE,
-) -> Tuple[DataLoader, DataLoader, Dict]:
+) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
     """
-    按时间顺序切分 EDF 文件（前 train_ratio → 训练，其余 → 验证）。
-    返回 (train_loader, val_loader, val_meta)。
-    val_meta 包含 true_events 和 total_hours 用于事件级评估。
+    按发作事件时序切分 EDF 文件为 train / val / test 三个集合，
+    保证 val 和 test 中各含至少一个发作文件（如发作数允许）。
+
+    返回 (train_loader, val_loader, test_loader, test_meta)。
+    test_meta 包含 true_events / total_hours / window_times。
     """
     patient_dir = data_root / patient
     seizure_map = parse_summary(patient_dir)
 
+    # 按 summary 顺序排列所有存在的 EDF 文件
     all_files = [f for f in seizure_map.keys() if (patient_dir / f).exists()]
     if not all_files:
         raise FileNotFoundError(f"在 {patient_dir} 中找不到任何 EDF 文件")
 
-    split_idx = max(1, int(len(all_files) * train_ratio))
-    train_files = all_files[:split_idx]
-    val_files   = all_files[split_idx:] if split_idx < len(all_files) else all_files[-1:]
+    # 将 EDF 文件分为"含发作"和"不含发作"两组，各自保持时间顺序
+    sz_files     = [f for f in all_files if seizure_map.get(f)]
+    non_sz_files = [f for f in all_files if not seizure_map.get(f)]
+    n_sz = len(sz_files)
 
-    train_ds = CHBMITPatientDataset(patient_dir, train_files, seizure_map)
-    val_ds   = CHBMITPatientDataset(patient_dir, val_files,   seizure_map)
+    # Step 1: 按比例分配含发作文件到 train / val / test
+    if n_sz >= 3:
+        n_train, n_val = n_sz - 2, 1   # 前 N-2 → train，倒数第2 → val，最后1 → test
+    elif n_sz == 2:
+        n_train, n_val = 1, 0           # 1→train，1→test；val 后续用 train 末尾
+    elif n_sz == 1:
+        n_train, n_val = 1, 0
+    else:
+        # 无发作：70/15/15 时序切分
+        n = len(all_files)
+        train_files = all_files[: int(n * 0.70)]
+        val_files   = all_files[int(n * 0.70) : int(n * 0.85)]
+        test_files  = all_files[int(n * 0.85):]
+        if not val_files:
+            val_files = train_files[-1:]
+        if not test_files:
+            test_files = all_files[-1:]
+        train_ds = CHBMITPatientDataset(patient_dir, train_files, seizure_map)
+        val_ds   = CHBMITPatientDataset(patient_dir, val_files,   seizure_map)
+        test_ds  = CHBMITPatientDataset(patient_dir, test_files,  seizure_map)
+        # 直接跳到 DataLoader 构建
+        n_sz = -1   # 标记已处理
 
-    # WeightedRandomSampler 缓解类别不平衡
+    if n_sz >= 0:
+        train_sz = list(sz_files[:n_train])
+        val_sz   = list(sz_files[n_train : n_train + n_val])
+        test_sz  = list(sz_files[n_train + n_val :])
+
+        # Step 2: 以时间位置边界将非发作文件填充到对应子集
+        order = {f: i for i, f in enumerate(all_files)}
+        train_boundary = order[train_sz[-1]]
+        val_boundary   = order[val_sz[-1]] if val_sz else train_boundary
+
+        for f in non_sz_files:
+            pos = order[f]
+            if pos <= train_boundary:
+                train_sz.append(f)
+            elif pos <= val_boundary:
+                val_sz.append(f)
+            else:
+                test_sz.append(f)
+
+        # Step 3: 各子集内按时间顺序排序
+        train_files = sorted(train_sz, key=lambda f: order[f])
+        val_files   = sorted(val_sz,   key=lambda f: order[f])
+        test_files  = sorted(test_sz,  key=lambda f: order[f])
+
+        # Step 4: 保底处理
+        if not val_files:
+            val_files = train_files[-1:]
+        if not test_files:
+            test_files = all_files[-1:]
+
+        print(f"  [{patient}] 切分 — train:{len(train_files)}文件"
+              f"(发作{sum(bool(seizure_map.get(f)) for f in train_files)}次) | "
+              f"val:{len(val_files)}文件"
+              f"(发作{sum(bool(seizure_map.get(f)) for f in val_files)}次) | "
+              f"test:{len(test_files)}文件"
+              f"(发作{sum(bool(seizure_map.get(f)) for f in test_files)}次)")
+
+        train_ds = CHBMITPatientDataset(patient_dir, train_files, seizure_map)
+        val_ds   = CHBMITPatientDataset(patient_dir, val_files,   seizure_map)
+        test_ds  = CHBMITPatientDataset(patient_dir, test_files,  seizure_map)
+
+    # WeightedRandomSampler 仅用于训练集
     train_labels = train_ds.get_labels()
     counts = np.bincount(train_labels, minlength=2).astype(float)
     counts = np.where(counts == 0, 1.0, counts)
@@ -165,22 +229,24 @@ def make_patient_dataloaders(
                               num_workers=0, pin_memory=False)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
                               num_workers=0, pin_memory=False)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+                              num_workers=0, pin_memory=False)
 
-    # 验证集元信息（事件级评估用）
-    val_seizure_events: List[Tuple[float, float]] = []
-    val_total_seconds = 0.0
-    for fname in val_files:
-        val_seizure_events.extend(seizure_map.get(fname, []))
+    # 测试集元信息（事件级评估用）
+    test_seizure_events: List[Tuple[float, float]] = []
+    test_total_seconds = 0.0
+    for fname in test_files:
+        test_seizure_events.extend(seizure_map.get(fname, []))
         try:
             n_samples = load_edf_header(patient_dir / fname)
-            val_total_seconds += n_samples / config.SFREQ
+            test_total_seconds += n_samples / config.SFREQ
         except Exception:
             pass
 
-    val_meta = {
-        "true_events": val_seizure_events,
-        "total_hours": val_total_seconds / 3600.0,
-        "window_times": val_ds.get_window_times(),
+    test_meta = {
+        "true_events": test_seizure_events,
+        "total_hours": test_total_seconds / 3600.0,
+        "window_times": test_ds.get_window_times(),
     }
 
-    return train_loader, val_loader, val_meta
+    return train_loader, val_loader, test_loader, test_meta

@@ -58,7 +58,6 @@ def train_patient(
     epochs: int = config.EPOCHS,
     batch_size: int = config.BATCH_SIZE,
     lr: float = config.LR,
-    train_ratio: float = config.TRAIN_RATIO,
 ) -> Tuple[torch.nn.Module, Dict]:
     """
     对单个患者进行完整训练流程。
@@ -66,8 +65,8 @@ def train_patient(
     val_info 包含: probs, labels, true_events, window_times, total_hours
     """
     print(f"[{patient}] 加载数据集...")
-    train_loader, val_loader, val_meta = make_patient_dataloaders(
-        patient, data_root, train_ratio=train_ratio, batch_size=batch_size
+    train_loader, val_loader, test_loader, test_meta = make_patient_dataloaders(
+        patient, data_root, batch_size=batch_size
     )
 
     if len(train_loader.dataset) == 0:
@@ -113,14 +112,14 @@ def train_patient(
 
     model.load_state_dict(best_state)
 
-    # 用最优模型重新推理验证集，获取最终概率序列
-    _, final_labels, final_probs = _eval_epoch(model, val_loader, criterion, device)
+    # 用最优模型在测试集上推理，获取最终概率序列
+    _, final_labels, final_probs = _eval_epoch(model, test_loader, criterion, device)
 
     val_info = {
         "probs":        final_probs,
         "labels":       final_labels.astype(int),
-        "true_events":  val_meta["true_events"],
-        "window_times": val_meta["window_times"],
-        "total_hours":  val_meta["total_hours"],
+        "true_events":  test_meta["true_events"],
+        "window_times": test_meta["window_times"],
+        "total_hours":  test_meta["total_hours"],
     }
     return model, val_info
