@@ -11,13 +11,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from data.summary_parser import parse_summary
 from data.edf_loader import load_edf, load_edf_header, ChannelMismatchError
-from preprocessing.dwt_filter import apply_dwt_to_segment
+from preprocessing.dwt_filter import dwt_bandpass
+
+
+def _apply_dwt_to_file(data: np.ndarray) -> np.ndarray:
+    """对完整 EDF 文件数据 [18, N] 逐通道做 DWT，返回 [18, N] float32。"""
+    return np.stack([dwt_bandpass(data[i]) for i in range(data.shape[0])]).astype(np.float32)
 
 
 class CHBMITPatientDataset(Dataset):
     """
     针对单个 CHB-MIT 患者的在线窗口化数据集。
-    DWT 滤波在 __getitem__ 时即时计算，不缓存到磁盘。
+    EDF 文件首次访问时加载并做 DWT，缓存到内存；后续窗口直接切片，不重复计算。
+    不写磁盘。
 
     windows 列表存储 (edf_path, start_sample, label, window_start_sec)。
     """
@@ -37,7 +43,8 @@ class CHBMITPatientDataset(Dataset):
         self.channels = channels or config.CHANNELS
         self.window_samples = window_samples
         self.apply_dwt = apply_dwt
-        self._cache: Dict[Path, np.ndarray] = {}  # EDF 文件级内存缓存
+        # EDF 文件级缓存：{path: [18, N] float32}（已做 DWT）
+        self._cache: Dict[Path, np.ndarray] = {}
 
         # windows: List[(edf_path, start_sample, label, window_start_sec)]
         self.windows: List[Tuple[Path, int, int, float]] = []
@@ -64,7 +71,6 @@ class CHBMITPatientDataset(Dataset):
                 continue
 
             seizures = seizure_map.get(fname, [])
-            # 转换为采样点区间
             sz_intervals = [(int(s * sfreq), int(e * sfreq)) for s, e in seizures]
 
             def _overlaps(t: int) -> bool:
@@ -91,9 +97,15 @@ class CHBMITPatientDataset(Dataset):
                 t += non_seizure_stride
 
     def _get_cached(self, edf_path: Path) -> np.ndarray:
-        """返回 EDF 文件的完整数据 [18, N_samples]，首次访问时加载并缓存。"""
+        """
+        首次访问时加载整个 EDF 文件并（可选）做全文件 DWT，存入缓存。
+        后续直接返回缓存数组，避免重复 I/O 和重复 DWT 计算。
+        """
         if edf_path not in self._cache:
-            self._cache[edf_path] = load_edf(edf_path, self.channels)
+            data = load_edf(edf_path, self.channels)  # [18, N] float32
+            if self.apply_dwt:
+                data = _apply_dwt_to_file(data)       # 每文件只做一次 DWT
+            self._cache[edf_path] = data
         return self._cache[edf_path]
 
     def __len__(self) -> int:
@@ -101,10 +113,8 @@ class CHBMITPatientDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         edf_path, start, label, _ = self.windows[idx]
-        data = self._get_cached(edf_path)                          # [18, N_total]
+        data = self._get_cached(edf_path)                            # [18, N]
         segment = data[:, start:start + self.window_samples].copy()  # [18, 1024]
-        if self.apply_dwt:
-            segment = apply_dwt_to_segment(segment)
         return torch.from_numpy(segment).float(), label
 
     def get_labels(self) -> List[int]:
@@ -128,7 +138,6 @@ def make_patient_dataloaders(
     patient_dir = data_root / patient
     seizure_map = parse_summary(patient_dir)
 
-    # EDF 文件按 summary 中的顺序排列（即时间顺序）
     all_files = [f for f in seizure_map.keys() if (patient_dir / f).exists()]
     if not all_files:
         raise FileNotFoundError(f"在 {patient_dir} 中找不到任何 EDF 文件")
@@ -140,10 +149,10 @@ def make_patient_dataloaders(
     train_ds = CHBMITPatientDataset(patient_dir, train_files, seizure_map)
     val_ds   = CHBMITPatientDataset(patient_dir, val_files,   seizure_map)
 
-    # 使用 WeightedRandomSampler 缓解类别不平衡
+    # WeightedRandomSampler 缓解类别不平衡
     train_labels = train_ds.get_labels()
     counts = np.bincount(train_labels, minlength=2).astype(float)
-    counts = np.where(counts == 0, 1.0, counts)  # 避免除零
+    counts = np.where(counts == 0, 1.0, counts)
     class_weights = 1.0 / counts
     sample_weights = [class_weights[l] for l in train_labels]
     sampler = WeightedRandomSampler(
@@ -157,7 +166,7 @@ def make_patient_dataloaders(
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
                               num_workers=0, pin_memory=False)
 
-    # 验证集元信息（用于事件级评估）
+    # 验证集元信息（事件级评估用）
     val_seizure_events: List[Tuple[float, float]] = []
     val_total_seconds = 0.0
     for fname in val_files:
