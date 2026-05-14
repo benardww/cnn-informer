@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import config
 from data.summary_parser import parse_summary
-from data.edf_loader import load_edf_header, get_edf_slice, ChannelMismatchError
+from data.edf_loader import load_edf, load_edf_header, ChannelMismatchError
 from preprocessing.dwt_filter import apply_dwt_to_segment
 
 
@@ -37,6 +37,7 @@ class CHBMITPatientDataset(Dataset):
         self.channels = channels or config.CHANNELS
         self.window_samples = window_samples
         self.apply_dwt = apply_dwt
+        self._cache: Dict[Path, np.ndarray] = {}  # EDF 文件级内存缓存
 
         # windows: List[(edf_path, start_sample, label, window_start_sec)]
         self.windows: List[Tuple[Path, int, int, float]] = []
@@ -89,12 +90,19 @@ class CHBMITPatientDataset(Dataset):
                     self.windows.append((edf_path, t, 0, t / sfreq))
                 t += non_seizure_stride
 
+    def _get_cached(self, edf_path: Path) -> np.ndarray:
+        """返回 EDF 文件的完整数据 [18, N_samples]，首次访问时加载并缓存。"""
+        if edf_path not in self._cache:
+            self._cache[edf_path] = load_edf(edf_path, self.channels)
+        return self._cache[edf_path]
+
     def __len__(self) -> int:
         return len(self.windows)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         edf_path, start, label, _ = self.windows[idx]
-        segment = get_edf_slice(edf_path, self.channels, start, start + self.window_samples)
+        data = self._get_cached(edf_path)                          # [18, N_total]
+        segment = data[:, start:start + self.window_samples].copy()  # [18, 1024]
         if self.apply_dwt:
             segment = apply_dwt_to_segment(segment)
         return torch.from_numpy(segment).float(), label

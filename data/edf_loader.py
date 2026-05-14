@@ -17,6 +17,8 @@ def _normalize_name(raw_name: str) -> str:
     name = raw_name.strip().upper()
     name = re.sub(r"^EEG\s+", "", name)
     name = re.sub(r"[-_](REF|LE|AVG)$", "", name)
+    # 去除 MNE 因重复通道名自动添加的数字后缀（如 T8-P8-0 → T8-P8）
+    name = re.sub(r"-\d+$", "", name)
     return name
 
 
