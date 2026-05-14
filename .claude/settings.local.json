@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /d/)",
+      "Read(//d//**)",
+      "WebSearch",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
